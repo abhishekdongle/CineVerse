@@ -1,0 +1,8 @@
+<resources>
+    <string name="home_error">Couldn\'t load the catalog.</string>
+    <string name="home_retry">Retry</string>
+    <string name="home_play">Play</string>
+    <string name="home_watch_live">Watch live</string>
+    <string name="home_badge_live">LIVE</string>
+    <string name="home_badge_free">FREE WITH ADS</string>
+</resources>

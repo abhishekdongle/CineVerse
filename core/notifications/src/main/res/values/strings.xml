@@ -1,0 +1,4 @@
+<resources>
+    <string name="notification_channel_general">General</string>
+    <string name="notification_channel_live_events">Live events</string>
+</resources>

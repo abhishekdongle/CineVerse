@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 320x180 launcher banner placeholder. Replace with branded artwork (PNG, xhdpi) before release. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <path
+        android:fillColor="#FF14101F"
+        android:pathData="M0,0h320v180h-320z" />
+    <path
+        android:fillColor="#FF7C4DFF"
+        android:pathData="M140,60v60l52,-30z" />
+</vector>
