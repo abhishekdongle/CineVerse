@@ -9,7 +9,8 @@ import com.cineverse.core.player.model.PlaybackRequest
 interface ProgressReporter {
     /**
      * Called every 15 seconds while playing, and with [isFinal] = true when playback pauses,
-     * ends or is released. Not called for live streams.
+     * ends or the player screen closes. Not called for live streams or during ads. The video
+     * player feature's ViewModel calls it; :core:player only declares the hook.
      */
     fun reportProgress(request: PlaybackRequest, positionMs: Long, durationMs: Long, isFinal: Boolean)
 }

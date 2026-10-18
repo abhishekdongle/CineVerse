@@ -7,8 +7,9 @@ import com.cineverse.core.player.model.PlayerState
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * The player API that UI modules build on. It holds no UI code, so a phone UI and a TV UI can
- * both drive it unchanged.
+ * The player API that features build on. It holds no UI code, so a phone UI and a TV UI can
+ * both drive it unchanged. Create one per screen with [PlayerControllerFactory] and call
+ * [release] when the screen goes away.
  */
 interface PlayerController {
 
@@ -25,6 +26,9 @@ interface PlayerController {
      * owned by the controller so it survives configuration changes.
      */
     val adViewContainer: ViewGroup
+
+    /** True when Google Cast is available on this device, so a Cast button can be shown. */
+    val isCastAvailable: Boolean
 
     /** Loads [request] and starts playback. Calling it again with the same id does nothing. */
     fun load(request: PlaybackRequest)
@@ -57,6 +61,9 @@ interface PlayerController {
 
     /** Clears an error and prepares the current item again. */
     fun retry()
+
+    /** Stops playback and frees the decoder, ads loader, MediaSession and Cast resources. */
+    fun release()
 
     companion object {
         const val DEFAULT_SEEK_INCREMENT_MS = 10_000L

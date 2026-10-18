@@ -7,7 +7,7 @@ codebase with Clean Architecture modules, Hilt, Compose and Jetpack Media3 (no t
 
 ```
 app/
-  mobile                 Phone/tablet app: MainActivity, navigation, Material 3 theme
+  mobile                 Phone/tablet app: MainActivity, navigation graph, Material 3 theme
   tv                     Android TV / Fire TV app: Leanback launcher, D-pad UI
 core/
   domain                 Pure Kotlin: models, repository interfaces, use cases
@@ -17,44 +17,85 @@ core/
   common                 Dispatchers, extensions, constants
   analytics              AnalyticsTracker interface + Logcat implementation
   notifications          FCM, notification channels
-  player                 Player engine (no UI): Media3 ExoPlayer, IMA ads, Cast, MediaSession
-  player-ui-mobile       Compose player UI for phones, tablets and foldables
+  player                 Playback library (no screens): Media3 ExoPlayer, IMA ads, Cast, MediaSession
 feature/home/
   presentation           HomeViewModel shared by mobile and TV
   ui                     Home screens (mobile and TV)
+feature/videoplayer/
+  presentation           VideoPlayerViewModel, VideoPlayerUiState, VideoPlayerAction (no Compose)
+  ui                     VideoPlayerScreen (Compose), TV player screen, navigation route
 build-logic/             Convention plugins and module dependency rules
 ```
 
-`build-logic` enforces the module rules at configuration time: features never depend on each
-other or on `:core:data`/`:core:network`/`:core:datastore`; `:core:domain` stays pure Kotlin;
-nothing depends on `:app:*`. A violation fails the build with an explanation.
+### Video player modules
+
+```
+:app:mobile / :app:tv
+        │  navigation graph only (videoPlayerScreen / tvVideoPlayerScreen)
+        ▼
+:feature:videoplayer:ui            Compose UI, window work (fullscreen, rotation, immersive, PiP)
+        │  api
+        ▼
+:feature:videoplayer:presentation  ViewModel, UiState, actions — plain unit tests, no Compose
+        │  api
+        ▼
+:core:player                       PlayerController + StateFlow<PlayerState>; no UI, no ViewModels
+```
+
+Dependency rules, enforced by `build-logic` at configuration time (a violation fails the build
+with an explanation):
+
+- One direction only: `ui → presentation → :core:player`. Presentation never depends on ui.
+- `:core:player` depends on no feature module (core modules never do; in practice it depends on
+  no project module at all).
+- Presentation modules may not apply the Compose compiler or depend on any `androidx.compose`
+  artifact.
+- Apps depend on a feature's `:ui` module, never directly on its `:presentation` module.
+  `:app:mobile` also declares `:core:player`, only for DI setup: `CastSupport.initialize` and binding
+  `PlaybackAnalyticsListener`.
+- Features never depend on each other or on `:core:data`/`:core:network`/`:core:datastore`;
+  `:core:domain` stays pure Kotlin; nothing depends on `:app:*`.
 
 ## Player
 
-### `:core:player` (engine, no UI)
+### `:core:player` (library, no UI)
 
-- `PlayerController`: the API every player UI uses.
+- `PlayerController`: the API every feature uses.
   - `state: StateFlow<PlayerState>`: playing, position, duration, buffered position, live/DVR,
     ad playback, video qualities, audio and subtitle tracks (with selection), speed, video size,
     casting, errors.
   - Commands: `load`, `play`, `pause`, `seekTo`, `seekForward`, `seekBack`, `setQuality`,
-    `setAudioTrack`, `setSubtitleTrack`, `setSpeed`, `goToLive`, `retry`.
-- `CineVersePlayer`: the Media3 implementation.
+    `setAudioTrack`, `setSubtitleTrack`, `setSpeed`, `goToLive`, `retry`, `release`.
+- `PlayerControllerFactory`: inject it (Hilt) to create one controller per screen. The Media3
+  implementation behind it is internal:
   - ExoPlayer with HLS and DASH, audio focus, pause on "becoming noisy" and a network wake lock.
   - IMA client-side ads (`media3-exoplayer-ima`) whenever `PlaybackRequest.adTagUrl` is set.
   - `CastPlayer` wrapping the local player when Cast is available. Media3 1.11 moves the media
     item and position between the phone and the Cast device in both directions.
   - A `MediaSession` published by `PlaybackService`: notification, lock screen, headset buttons.
-- `PlayerViewModel`: owns one controller per screen, so configuration changes, fullscreen and
-  PiP never recreate the player.
-- `TrackLabels`: human-readable track names ("English (5.1)", "French (forced)"), shared by all UIs.
+- `PlaybackRequest`: what to play. Used by the feature and by the apps.
+- `TrackLabels`: human-readable track names ("English (5.1)", "French (forced)").
 - Hooks, bound through Hilt sets (`@Binds @IntoSet`; both sets are empty by default):
   - `PlaybackAnalyticsListener`: start, buffering, quality change, error, progress every 15 s.
-  - `ProgressReporter`: watch progress for your backend.
+    Called by the player.
+  - `ProgressReporter`: watch progress for your backend, every 15 s and when playback pauses,
+    ends or the screen closes. Called by `VideoPlayerViewModel`.
 
-### `:core:player-ui-mobile`
+### `:feature:videoplayer:presentation`
 
-Fully custom Compose controls; Media3's `PlayerView` controller is not used.
+- `VideoPlayerViewModel` owns the screen's `PlayerController`, so rotation, fullscreen, resizing
+  and PiP never recreate the player. It exposes `uiState: StateFlow<VideoPlayerUiState>` and
+  takes every input through `onAction(VideoPlayerAction)`.
+- It handles control visibility and the auto-hide timer, the settings panel (open, page,
+  option lists), fullscreen (phones go fullscreen in landscape; large screens only on request),
+  PiP flags, double-tap seek feedback, errors and retry, and progress reporting.
+- Tested with plain JVM unit tests (`VideoPlayerViewModelTest`) against `RecordingPlayerController`, a test double that records commands.
+
+### `:feature:videoplayer:ui`
+
+Fully custom Compose controls; Media3's `PlayerView` controller is not used on mobile. The UI
+only renders `VideoPlayerUiState` and sends actions; the window work that needs an Activity lives
+here.
 
 - Inline and fullscreen modes; immersive fullscreen; rotation that respects the system
   rotation lock.
@@ -69,11 +110,24 @@ Fully custom Compose controls; Media3's `PlayerView` controller is not used.
   from the video, play/pause remote action. All controls are hidden in PiP.
 - Accessibility: TalkBack labels and state descriptions, 48 dp touch targets, no auto-hide while
   TalkBack is on, and subtitles styled with the system caption settings.
+- `TvVideoPlayerScreen`: interim TV screen on the same ViewModel, using Media3's D-pad-ready
+  `PlayerView`.
 
-### Calling `PlayerScreen`
+### Using the player from an app
 
 ```kotlin
-PlayerScreen(
+NavHost(navController, startDestination = HomeRoute) {
+    composable<HomeRoute> {
+        HomeMobileScreen(onPlay = { item -> navController.navigateToVideoPlayer(item.toPlaybackRequest()) })
+    }
+    videoPlayerScreen(onBack = { navController.popBackStack() })   // tvVideoPlayerScreen() on TV
+}
+```
+
+Or call the screen directly, optionally with a config:
+
+```kotlin
+VideoPlayerScreen(
     request = PlaybackRequest(
         id = "tears-of-steel",
         title = "Tears of Steel",
@@ -81,14 +135,18 @@ PlayerScreen(
         type = ContentType.VOD,
         adTagUrl = null,                 // VAST/VMAP URL for AVOD
     ),
+    onBack = { navController.popBackStack() },
     config = PlayerUiConfig(
         seekIncrementMs = 15_000,
         controls = PlayerControlsConfig(showCast = false),
         slots = PlayerSlots(
-            overlay = { if (state.positionMs in 5_000..30_000) SkipIntroButton { controller.seekTo(30_000) } },
+            overlay = {
+                if (uiState.positionMs in 5_000..30_000) {
+                    SkipIntroButton { onAction(VideoPlayerAction.SeekTo(30_000)) }
+                }
+            },
         ),
     ),
-    onBack = { navController.popBackStack() },
 )
 ```
 
@@ -101,22 +159,12 @@ Requirements for the host activity:
 - Call `CastSupport.initialize(this)` in `Application.onCreate()`. It is a safe no-op without
   Google Play services.
 
-Pass your own `PlayerController` to the second `PlayerScreen` overload if you don't want the
-Hilt `PlayerViewModel`.
+### Replacing the interim TV player
 
-### Adding `:core:player-ui-tv`
-
-1. Create the module with the `cineverse.android.library.compose` plugin, depending on
-   `projects.core.player` and `androidx.tv:tv-material`.
-2. Get the controller from `hiltViewModel<PlayerViewModel>().controller`, call
-   `controller.load(request)`, and render `controller.player` with `ContentFrame` from
-   `media3-ui-compose`.
-3. Build D-pad controls from `controller.state` (focusable TV Material buttons, a seek bar that
-   handles left/right keys). Reuse `TrackLabels` for the settings lists. Host
-   `controller.adViewContainer` for IMA ads.
-4. Replace `app/tv`'s interim `TvPlayerScreen` (Media3 `PlayerView`) with the new screen.
-
-`:core:player` needs no changes; the TV app already uses it today.
+Add Compose for TV controls in `:feature:videoplayer:ui` (next to `tv/TvVideoPlayerScreen.kt`)
+that render `VideoPlayerUiState`: focusable TV Material buttons and a seek bar that handles
+left/right keys, sending the same `VideoPlayerAction`s. Host `viewModel.adViewContainer` for IMA
+ads. Neither `:core:player` nor the presentation module changes.
 
 ## Sample content
 

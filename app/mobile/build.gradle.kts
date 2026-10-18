@@ -25,8 +25,9 @@ android {
 dependencies {
     implementation(projects.feature.home.ui)
     implementation(projects.core.domain)
+    implementation(projects.feature.videoplayer.ui)
+    // DI setup only: Cast initialization and the PlaybackAnalyticsListener binding.
     implementation(projects.core.player)
-    implementation(projects.core.playerUiMobile)
     implementation(projects.core.analytics)
     implementation(projects.core.notifications)
     // Not used from app code: it puts the repository bindings into this app's Hilt graph.

@@ -28,7 +28,7 @@ android {
 dependencies {
     implementation(projects.feature.home.ui)
     implementation(projects.core.domain)
-    implementation(projects.core.player)
+    implementation(projects.feature.videoplayer.ui)
     implementation(projects.core.notifications)
     // Not used from app code: it puts the repository bindings into this app's Hilt graph.
     implementation(projects.core.data)
@@ -38,9 +38,6 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.navigation.compose)
-    implementation(libs.androidx.media3.ui)
-    implementation(libs.androidx.lifecycle.runtime.compose)
-    implementation(libs.androidx.hilt.lifecycle.viewmodel.compose)
 
     testImplementation(libs.junit)
 }

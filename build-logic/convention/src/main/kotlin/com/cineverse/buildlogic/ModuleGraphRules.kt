@@ -30,6 +30,9 @@ object ModuleGraphRules {
             from.startsWith(":core:") && toFeature != null ->
                 "core modules must not depend on feature modules."
 
+            from.startsWith(":app:") && toFeature != null && to.endsWith(":presentation") ->
+                "app modules depend on a feature's :ui module, which brings its presentation module."
+
             fromFeature != null && toFeature != null && fromFeature != toFeature ->
                 "features must not depend on each other (:feature:$fromFeature -> :feature:$toFeature). " +
                     "Move the shared code into a :core module, or let the app module wire the two together."

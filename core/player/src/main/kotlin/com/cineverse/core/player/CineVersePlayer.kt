@@ -26,7 +26,6 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionToken
 import com.cineverse.core.player.analytics.PlaybackAnalyticsListener
-import com.cineverse.core.player.analytics.ProgressReporter
 import com.cineverse.core.player.cast.CastSupport
 import com.cineverse.core.player.internal.MediaItemFactory
 import com.cineverse.core.player.internal.TrackMapper
@@ -58,12 +57,11 @@ import javax.inject.Inject
  * - CastPlayer wrapping the local player when Cast is available, so handoff keeps position.
  * - A MediaSession published through [PlaybackService] for system media controls.
  *
- * Create through [Factory] (usually via [PlayerViewModel]) and call [release] when done.
+ * Features get it through [PlayerControllerFactory] and call [release] when done.
  */
-class CineVersePlayer private constructor(
+internal class CineVersePlayer private constructor(
     private val context: Context,
     private val analyticsListeners: Set<PlaybackAnalyticsListener>,
-    private val progressReporters: Set<ProgressReporter>,
 ) : PlayerController {
 
     private val scope = MainScope()
@@ -94,8 +92,10 @@ class CineVersePlayer private constructor(
         // (CaptioningManager), so subtitles start in the user's preferred language when enabled.
         .build()
 
+    override val isCastAvailable: Boolean = CastSupport.isAvailable(context)
+
     override val player: Player =
-        if (CastSupport.isAvailable(context)) {
+        if (isCastAvailable) {
             CastPlayer.Builder(context).setLocalPlayer(exoPlayer).build()
         } else {
             exoPlayer
@@ -144,7 +144,6 @@ class CineVersePlayer private constructor(
                 }
                 bufferingStartedAtMs = null
             }
-            if (playbackState == Player.STATE_ENDED) reportProgress(isFinal = true)
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -153,7 +152,6 @@ class CineVersePlayer private constructor(
                 playbackStartedReported = true
                 analyticsListeners.forEach { it.onPlaybackStarted(request) }
             }
-            if (!isPlaying && player.playbackState == Player.STATE_READY) reportProgress(isFinal = true)
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -272,11 +270,9 @@ class CineVersePlayer private constructor(
         player.play()
     }
 
-    /** Stops playback and frees the decoder, ads loader, MediaSession and Cast resources. */
-    fun release() {
+    override fun release() {
         if (released) return
         released = true
-        reportProgress(isFinal = true)
         scope.cancel()
         MediaController.releaseFuture(sessionControllerFuture)
         if (ActiveSessionHolder.session === mediaSession) ActiveSessionHolder.session = null
@@ -299,7 +295,7 @@ class CineVersePlayer private constructor(
                     sinceProgressMs += TICK_MS
                     if (sinceProgressMs >= PlaybackAnalyticsListener.PROGRESS_INTERVAL_MS) {
                         sinceProgressMs = 0L
-                        reportProgress(isFinal = false)
+                        reportProgress()
                     }
                 }
             }
@@ -359,15 +355,13 @@ class CineVersePlayer private constructor(
         return (window.defaultPositionMs - p.currentPosition).coerceAtLeast(0L)
     }
 
-    private fun reportProgress(isFinal: Boolean) {
+    /** Analytics progress only; watch progress for the backend ([com.cineverse.core.player.analytics.ProgressReporter]) is reported by the screen. */
+    private fun reportProgress() {
         val request = _state.value.request ?: return
-        if (released && !isFinal) return
         val p = player
         if (p.isCurrentMediaItemLive || p.isPlayingAd) return
-        val position = p.currentPosition
         val duration = p.duration.takeIf { it != C.TIME_UNSET } ?: return
-        if (!isFinal) analyticsListeners.forEach { it.onProgress(request, position, duration) }
-        progressReporters.forEach { it.reportProgress(request, position, duration, isFinal) }
+        analyticsListeners.forEach { it.onProgress(request, p.currentPosition, duration) }
     }
 
     private fun sessionActivity(): PendingIntent? {
@@ -387,9 +381,8 @@ class CineVersePlayer private constructor(
     class Factory @Inject constructor(
         @param:ApplicationContext private val context: Context,
         private val analyticsListeners: Set<@JvmSuppressWildcards PlaybackAnalyticsListener>,
-        private val progressReporters: Set<@JvmSuppressWildcards ProgressReporter>,
-    ) {
-        fun create(): CineVersePlayer = CineVersePlayer(context, analyticsListeners, progressReporters)
+    ) : PlayerControllerFactory {
+        override fun create(): PlayerController = CineVersePlayer(context, analyticsListeners)
     }
 
     private companion object {
