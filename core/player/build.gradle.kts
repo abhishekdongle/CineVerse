@@ -13,7 +13,9 @@ android {
 dependencies {
     api(libs.androidx.media3.exoplayer)
     api(libs.androidx.media3.session)
-    api(libs.androidx.media3.cast)
+    // implementation: Cast types stay internal. media3-cast also bundles Compose (MediaRouteButton),
+    // which must not leak onto the compile classpath of presentation modules.
+    implementation(libs.androidx.media3.cast)
     implementation(libs.androidx.media3.exoplayer.hls)
     implementation(libs.androidx.media3.exoplayer.dash)
     implementation(libs.androidx.media3.exoplayer.ima)

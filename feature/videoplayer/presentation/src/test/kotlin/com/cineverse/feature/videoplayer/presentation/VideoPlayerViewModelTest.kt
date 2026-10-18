@@ -47,6 +47,18 @@ class VideoPlayerViewModelTest {
         Dispatchers.resetMain()
     }
 
+    /**
+     * runTest that clears the ViewModel before finishing. runTest runs every task left on the
+     * shared test clock, so an uncancelled viewModelScope loop (progress reporting) never ends.
+     */
+    private fun playerTest(block: suspend TestScope.() -> Unit) = runTest {
+        try {
+            block()
+        } finally {
+            store.clear()
+        }
+    }
+
     private fun createViewModel(): VideoPlayerViewModel {
         val factory = viewModelFactory { initializer { VideoPlayerViewModel({ controller }, setOf(reporter)) } }
         return ViewModelProvider.create(store, factory)[VideoPlayerViewModel::class]
@@ -59,7 +71,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `load starts the request and shows its title`() = runTest {
+    fun `load starts the request and shows its title`() = playerTest {
         val viewModel = createViewModel()
 
         viewModel.onAction(VideoPlayerAction.Load(vod))
@@ -71,7 +83,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `maps tracks into settings options with Auto and Off entries`() = runTest {
+    fun `maps tracks into settings options with Auto and Off entries`() = playerTest {
         val viewModel = createViewModel()
         controller.update {
             it.copy(
@@ -98,7 +110,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `settings selections go to the player and return to the main page`() = runTest {
+    fun `settings selections go to the player and return to the main page`() = playerTest {
         val viewModel = createViewModel()
         viewModel.onAction(VideoPlayerAction.SettingsOpened)
         viewModel.onAction(VideoPlayerAction.SettingsPageOpened(SettingsPage.Quality))
@@ -115,7 +127,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `settings back closes a sub-page first, then the panel`() = runTest {
+    fun `settings back closes a sub-page first, then the panel`() = playerTest {
         val viewModel = createViewModel()
         viewModel.onAction(VideoPlayerAction.SettingsOpened)
         viewModel.onAction(VideoPlayerAction.SettingsPageOpened(SettingsPage.Audio))
@@ -129,7 +141,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `settings are hidden during ads and in picture-in-picture`() = runTest {
+    fun `settings are hidden during ads and in picture-in-picture`() = playerTest {
         val viewModel = createViewModel()
         viewModel.onAction(VideoPlayerAction.SettingsOpened)
 
@@ -143,7 +155,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `controls auto-hide after the delay while playing`() = runTest {
+    fun `controls auto-hide after the delay while playing`() = playerTest {
         val viewModel = createViewModel()
         playing()
         assertTrue(viewModel.uiState.value.controlsVisible)
@@ -158,7 +170,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `interaction restarts the auto-hide timer`() = runTest {
+    fun `interaction restarts the auto-hide timer`() = playerTest {
         val viewModel = createViewModel()
         playing()
         advanceTimeBy(3_000)
@@ -171,7 +183,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `controls stay visible while paused, scrubbing, in settings or with TalkBack`() = runTest {
+    fun `controls stay visible while paused, scrubbing, in settings or with TalkBack`() = playerTest {
         val viewModel = createViewModel()
         advanceTimeBy(10_000)
         assertTrue("paused", viewModel.uiState.value.controlsVisible)
@@ -194,7 +206,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `phones go fullscreen in landscape, large screens only on request`() = runTest {
+    fun `phones go fullscreen in landscape, large screens only on request`() = playerTest {
         val viewModel = createViewModel()
 
         viewModel.onAction(VideoPlayerAction.WindowChanged(isLargeScreen = false, isLandscape = true))
@@ -211,7 +223,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `double tap seeks and accumulates feedback on the same side`() = runTest {
+    fun `double tap seeks and accumulates feedback on the same side`() = playerTest {
         val viewModel = createViewModel()
         playing()
 
@@ -228,7 +240,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `double tap is ignored when the stream cannot seek`() = runTest {
+    fun `double tap is ignored when the stream cannot seek`() = playerTest {
         val viewModel = createViewModel()
         controller.update { it.copy(isLive = true, isSeekable = true, durationMs = 30_000) }
 
@@ -239,7 +251,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `live state shows distance behind the live edge, including while scrubbing`() = runTest {
+    fun `live state shows distance behind the live edge, including while scrubbing`() = playerTest {
         val viewModel = createViewModel()
         controller.update {
             it.copy(isLive = true, isSeekable = true, durationMs = 300_000, positionMs = 200_000, liveBehindMs = 60_000)
@@ -255,7 +267,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `errors expose a message and retry goes to the player`() = runTest {
+    fun `errors expose a message and retry goes to the player`() = playerTest {
         val viewModel = createViewModel()
         controller.update { it.copy(status = PlaybackStatus.Error, error = PlayerError(2001, "ERROR_CODE_IO_NETWORK_CONNECTION_FAILED", null)) }
 
@@ -265,7 +277,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `backgrounding pauses unless casting`() = runTest {
+    fun `backgrounding pauses unless casting`() = playerTest {
         val viewModel = createViewModel()
         viewModel.onAction(VideoPlayerAction.AppBackgrounded)
 
@@ -278,7 +290,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `reports progress periodically, on pause and when the screen closes`() = runTest {
+    fun `reports progress periodically, on pause and when the screen closes`() = playerTest {
         val viewModel = createViewModel()
         viewModel.onAction(VideoPlayerAction.Load(vod))
         playing(positionMs = 1_000)
@@ -297,7 +309,7 @@ class VideoPlayerViewModelTest {
     }
 
     @Test
-    fun `does not report progress for live streams or ads`() = runTest {
+    fun `does not report progress for live streams or ads`() = playerTest {
         createViewModel().onAction(VideoPlayerAction.Load(vod.copy(type = ContentType.LIVE)))
         controller.update { it.copy(isLive = true, isPlaying = true, status = PlaybackStatus.Ready, durationMs = 600_000) }
         advanceTimeBy(30_000)
