@@ -4,10 +4,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Scaffold
-import androidx.compose.ui.Modifier
 import com.cineverse.mobile.navigation.MobileNavHost
 import com.cineverse.mobile.ui.theme.CineVerseTheme
 import dagger.hilt.android.AndroidEntryPoint
@@ -19,9 +15,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             CineVerseTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    MobileNavHost(modifier = Modifier.padding(innerPadding))
-                }
+                // Each destination handles its own insets: the player draws edge to edge in fullscreen.
+                MobileNavHost()
             }
         }
     }

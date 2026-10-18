@@ -38,6 +38,7 @@ include(":core:data")
 include(":core:domain")
 include(":core:datastore")
 include(":core:player")
+include(":core:player-ui-mobile")
 include(":core:analytics")
 include(":core:notifications")
 

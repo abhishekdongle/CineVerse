@@ -26,14 +26,20 @@ internal fun RailDto.toDomain() = Rail(
 internal fun MediaItemDto.toDomain() = MediaItem(
     id = id,
     title = title,
+    subtitle = subtitle,
     description = description,
     posterUrl = posterUrl,
     backdropUrl = backdropUrl.ifEmpty { posterUrl },
     streamUrl = streamUrl,
-    contentType = if (type.equals("live", ignoreCase = true)) ContentType.LIVE else ContentType.VOD,
+    contentType = when (type.lowercase()) {
+        "live" -> ContentType.LIVE
+        "clip" -> ContentType.CLIP
+        else -> ContentType.VOD
+    },
     access = if (access.equals("avod", ignoreCase = true)) {
         AccessModel.AD_SUPPORTED
     } else {
         AccessModel.SUBSCRIPTION
     },
+    adTagUrl = adTagUrl,
 )

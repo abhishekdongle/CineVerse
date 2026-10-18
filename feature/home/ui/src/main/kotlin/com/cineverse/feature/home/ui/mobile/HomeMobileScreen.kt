@@ -4,6 +4,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -134,13 +136,19 @@ private fun MobileRail(rail: Rail, onItemClick: (MediaItem) -> Unit) {
                         contentDescription = item.title,
                         modifier = Modifier.aspectRatio(2f / 3f),
                     )
+                    Text(
+                        item.title,
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 2,
+                        modifier = Modifier.padding(start = 8.dp, end = 8.dp, top = 8.dp),
+                    )
                     item.badgeLabel()?.let { badge ->
                         AssistChip(
                             onClick = { onItemClick(item) },
                             label = { Text(badge, style = MaterialTheme.typography.labelSmall) },
                             modifier = Modifier.padding(horizontal = 8.dp),
                         )
-                    }
+                    } ?: Spacer(Modifier.height(8.dp))
                 }
             }
         }

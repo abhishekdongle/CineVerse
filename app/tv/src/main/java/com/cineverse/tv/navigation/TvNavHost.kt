@@ -8,10 +8,11 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.cineverse.core.domain.model.ContentType
 import com.cineverse.core.domain.model.MediaItem
-import com.cineverse.core.player.PlayableMedia
-import com.cineverse.core.player.ui.PlayerScreen
+import com.cineverse.core.player.model.PlaybackRequest
+import com.cineverse.tv.player.TvPlayerScreen
 import com.cineverse.feature.home.ui.tv.HomeTvScreen
 import kotlinx.serialization.Serializable
+import com.cineverse.core.player.model.ContentType as PlayerContentType
 
 @Serializable
 data object HomeRoute
@@ -21,7 +22,8 @@ data class PlayerRoute(
     val id: String,
     val title: String,
     val streamUrl: String,
-    val isLive: Boolean,
+    val type: String,
+    val adTagUrl: String?,
 )
 
 /** TV navigation graph. The remote's Back button pops the back stack like the system back on mobile. */
@@ -34,7 +36,15 @@ fun TvNavHost(modifier: Modifier = Modifier) {
         }
         composable<PlayerRoute> { entry ->
             val route = entry.toRoute<PlayerRoute>()
-            PlayerScreen(PlayableMedia(route.id, route.title, route.streamUrl, route.isLive))
+            TvPlayerScreen(
+                PlaybackRequest(
+                    id = route.id,
+                    title = route.title,
+                    streamUrl = route.streamUrl,
+                    type = PlayerContentType.valueOf(route.type),
+                    adTagUrl = route.adTagUrl,
+                ),
+            )
         }
     }
 }
@@ -43,5 +53,10 @@ private fun MediaItem.toPlayerRoute() = PlayerRoute(
     id = id,
     title = title,
     streamUrl = streamUrl,
-    isLive = contentType == ContentType.LIVE,
+    type = when (contentType) {
+        ContentType.VOD -> PlayerContentType.VOD
+        ContentType.LIVE -> PlayerContentType.LIVE
+        ContentType.CLIP -> PlayerContentType.CLIP
+    }.name,
+    adTagUrl = adTagUrl,
 )

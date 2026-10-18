@@ -20,12 +20,14 @@ data class RailDto(
 data class MediaItemDto(
     val id: String,
     val title: String,
+    val subtitle: String? = null,
     val description: String = "",
     @SerialName("poster_url") val posterUrl: String = "",
     @SerialName("backdrop_url") val backdropUrl: String = "",
     @SerialName("stream_url") val streamUrl: String,
-    /** "vod" or "live". */
+    /** "vod", "live" or "clip". */
     val type: String,
     /** "svod" or "avod". */
     val access: String,
+    @SerialName("ad_tag_url") val adTagUrl: String? = null,
 )

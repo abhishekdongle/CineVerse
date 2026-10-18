@@ -1,132 +1,401 @@
 package com.cineverse.core.player
 
+import android.app.PendingIntent
+import android.content.ComponentName
 import android.content.Context
-import androidx.annotation.OptIn
+import android.os.SystemClock
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import androidx.media3.cast.CastPlayer
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MediaMetadata
-import androidx.media3.common.MimeTypes
+import androidx.media3.common.DeviceInfo
+import androidx.media3.common.Format
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.ExoPlayer
-import com.cineverse.core.analytics.AnalyticsEvent
-import com.cineverse.core.analytics.AnalyticsTracker
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.ima.ImaAdsLoader
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.ads.AdsLoader
+import androidx.media3.common.AdViewProvider
+import androidx.media3.session.MediaController
+import androidx.media3.session.MediaSession
+import androidx.media3.session.SessionToken
+import com.cineverse.core.player.analytics.PlaybackAnalyticsListener
+import com.cineverse.core.player.analytics.ProgressReporter
+import com.cineverse.core.player.cast.CastSupport
+import com.cineverse.core.player.internal.MediaItemFactory
+import com.cineverse.core.player.internal.TrackMapper
+import com.cineverse.core.player.internal.TrackSnapshot
+import com.cineverse.core.player.model.ContentType
+import com.cineverse.core.player.model.PlaybackRequest
+import com.cineverse.core.player.model.PlaybackStatus
+import com.cineverse.core.player.model.PlayerError
+import com.cineverse.core.player.model.PlayerState
+import com.cineverse.core.player.model.VideoQuality
+import com.cineverse.core.player.session.ActiveSessionHolder
+import com.cineverse.core.player.session.PlaybackService
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.util.UUID
 import javax.inject.Inject
 
 /**
- * Thin wrapper around Media3 [ExoPlayer] used by both apps. It handles HLS VOD and live streams
- * and exposes playback as a [StateFlow]. Create one per playback screen through [Factory] and
- * call [release] when that screen goes away.
+ * Media3 implementation of [PlayerController]:
+ * - ExoPlayer with HLS/DASH, audio focus, becoming-noisy handling and a network wake lock.
+ * - IMA client-side ads when [PlaybackRequest.adTagUrl] is set.
+ * - CastPlayer wrapping the local player when Cast is available, so handoff keeps position.
+ * - A MediaSession published through [PlaybackService] for system media controls.
+ *
+ * Create through [Factory] (usually via [PlayerViewModel]) and call [release] when done.
  */
 class CineVersePlayer private constructor(
-    context: Context,
-    private val analytics: AnalyticsTracker,
-) {
-    /** Exposed for the video surface only; drive playback through this class's methods. */
-    val exoPlayer: ExoPlayer = ExoPlayer.Builder(context)
+    private val context: Context,
+    private val analyticsListeners: Set<PlaybackAnalyticsListener>,
+    private val progressReporters: Set<ProgressReporter>,
+) : PlayerController {
+
+    private val scope = MainScope()
+
+    private val adsLoader: ImaAdsLoader = ImaAdsLoader.Builder(context).build()
+
+    override val adViewContainer: ViewGroup = FrameLayout(context)
+
+    private val adViewProvider = object : AdViewProvider {
+        override fun getAdViewGroup(): ViewGroup = adViewContainer
+    }
+
+    private val exoPlayer: ExoPlayer = ExoPlayer.Builder(context)
+        .setMediaSourceFactory(
+            DefaultMediaSourceFactory(context)
+                .setLocalAdInsertionComponents(AdsLoader.Provider { adsLoader }, adViewProvider),
+        )
+        .setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build(),
+            /* handleAudioFocus = */ true,
+        )
         .setHandleAudioBecomingNoisy(true)
+        .setWakeMode(C.WAKE_MODE_NETWORK)
+        // The default track selection parameters already follow the system caption settings
+        // (CaptioningManager), so subtitles start in the user's preferred language when enabled.
         .build()
 
-    private val _state = MutableStateFlow(PlaybackState())
-    val state: StateFlow<PlaybackState> = _state.asStateFlow()
+    override val player: Player =
+        if (CastSupport.isAvailable(context)) {
+            CastPlayer.Builder(context).setLocalPlayer(exoPlayer).build()
+        } else {
+            exoPlayer
+        }
 
-    private val listener = object : Player.Listener {
-        override fun onPlaybackStateChanged(playbackState: Int) {
-            val status = when (playbackState) {
-                Player.STATE_BUFFERING -> PlaybackState.Status.Buffering
-                Player.STATE_READY -> PlaybackState.Status.Ready
-                Player.STATE_ENDED -> PlaybackState.Status.Ended
-                else -> PlaybackState.Status.Idle
+    private val mediaSession: MediaSession = MediaSession.Builder(context, player)
+        .setId("cineverse-${UUID.randomUUID()}")
+        .apply { sessionActivity()?.let(::setSessionActivity) }
+        .build()
+
+    private val sessionControllerFuture = run {
+        ActiveSessionHolder.session = mediaSession
+        // Connecting a controller binds PlaybackService, which then publishes the session.
+        MediaController.Builder(
+            context,
+            SessionToken(context, ComponentName(context, PlaybackService::class.java)),
+        ).buildAsync()
+    }
+
+    private val _state = MutableStateFlow(PlayerState())
+    override val state: StateFlow<PlayerState> = _state.asStateFlow()
+
+    private var tracks: TrackSnapshot = TrackSnapshot.EMPTY
+    private var currentVideoHeight: Int? = null
+    private var playbackStartedReported = false
+    private var bufferingStartedAtMs: Long? = null
+    private var released = false
+
+    private val playerListener = object : Player.Listener {
+        override fun onEvents(player: Player, events: Player.Events) {
+            if (events.containsAny(Player.EVENT_TRACKS_CHANGED, Player.EVENT_TRACK_SELECTION_PARAMETERS_CHANGED)) {
+                tracks = TrackMapper.map(player.currentTracks, player.trackSelectionParameters)
             }
-            _state.update { it.copy(status = status, isAtLiveEdge = isAtLiveEdge()) }
+            updateState()
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            val request = _state.value.request ?: return
+            if (playbackState == Player.STATE_BUFFERING && !player.isPlayingAd) {
+                bufferingStartedAtMs = SystemClock.elapsedRealtime()
+                analyticsListeners.forEach { it.onBufferingStarted(request, player.currentPosition) }
+            } else {
+                bufferingStartedAtMs?.let { started ->
+                    val duration = SystemClock.elapsedRealtime() - started
+                    analyticsListeners.forEach { it.onBufferingEnded(request, player.currentPosition, duration) }
+                }
+                bufferingStartedAtMs = null
+            }
+            if (playbackState == Player.STATE_ENDED) reportProgress(isFinal = true)
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            _state.update { it.copy(isPlaying = isPlaying, isAtLiveEdge = isAtLiveEdge()) }
+            val request = _state.value.request ?: return
+            if (isPlaying && !player.isPlayingAd && !playbackStartedReported) {
+                playbackStartedReported = true
+                analyticsListeners.forEach { it.onPlaybackStarted(request) }
+            }
+            if (!isPlaying && player.playbackState == Player.STATE_READY) reportProgress(isFinal = true)
         }
 
         override fun onPlayerError(error: PlaybackException) {
-            _state.update { it.copy(status = PlaybackState.Status.Error, errorMessage = error.message) }
-            analytics.track(
-                AnalyticsEvent(
-                    AnalyticsEvent.Types.PLAYBACK_ERROR,
-                    mapOf(AnalyticsEvent.Params.ERROR_CODE to error.errorCodeName),
-                ),
-            )
+            if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) {
+                // Paused too long on a live stream: rejoin the live window instead of failing.
+                player.seekToDefaultPosition()
+                player.prepare()
+                return
+            }
+            val request = _state.value.request ?: return
+            val playerError = error.toPlayerError()
+            analyticsListeners.forEach { it.onPlaybackError(request, playerError) }
+        }
+    }
+
+    private val exoAnalyticsListener = object : AnalyticsListener {
+        override fun onVideoInputFormatChanged(
+            eventTime: AnalyticsListener.EventTime,
+            format: Format,
+            decoderReuseEvaluation: DecoderReuseEvaluation?,
+        ) {
+            if (format.height <= 0) return
+            currentVideoHeight = format.height
+            val request = _state.value.request ?: return
+            if (exoPlayer.isPlayingAd) return
+            val quality = VideoQuality(format.id.orEmpty(), format.width, format.height, format.bitrate)
+            analyticsListeners.forEach { it.onQualityChanged(request, quality) }
         }
     }
 
     init {
-        exoPlayer.addListener(listener)
+        adsLoader.setPlayer(exoPlayer)
+        player.addListener(playerListener)
+        exoPlayer.addAnalyticsListener(exoAnalyticsListener)
+        startTicker()
     }
 
-    /** Loads [media] and starts playback. Live streams start at the live edge. */
-    fun load(media: PlayableMedia, playWhenReady: Boolean = true) {
-        if (_state.value.media?.id == media.id) return
-        val mediaItem = MediaItem.Builder()
-            .setMediaId(media.id)
-            .setUri(media.streamUrl)
-            .setMimeType(MimeTypes.APPLICATION_M3U8)
-            .setMediaMetadata(MediaMetadata.Builder().setTitle(media.title).build())
+    override fun load(request: PlaybackRequest) {
+        if (_state.value.request?.id == request.id) return
+        playbackStartedReported = false
+        val mediaItem = MediaItemFactory.create(request)
+        if (request.type == ContentType.LIVE || request.startPositionMs <= 0L) {
+            player.setMediaItem(mediaItem)
+        } else {
+            player.setMediaItem(mediaItem, request.startPositionMs)
+        }
+        player.playbackParameters = player.playbackParameters.withSpeed(1f)
+        player.prepare()
+        player.playWhenReady = true
+        _state.value = PlayerState(request = request, status = PlaybackStatus.Buffering, playWhenReady = true)
+    }
+
+    override fun play() {
+        if (player.playbackState == Player.STATE_ENDED) player.seekToDefaultPosition()
+        if (player.playbackState == Player.STATE_IDLE) player.prepare()
+        player.play()
+    }
+
+    override fun pause() = player.pause()
+
+    override fun togglePlayPause() {
+        if (player.playWhenReady && player.playbackState != Player.STATE_ENDED) pause() else play()
+    }
+
+    override fun seekTo(positionMs: Long) {
+        if (!_state.value.canSeek) return
+        val duration = player.duration.takeIf { it != C.TIME_UNSET }
+        player.seekTo(positionMs.coerceIn(0L, duration ?: Long.MAX_VALUE))
+    }
+
+    override fun seekForward(incrementMs: Long) = seekTo(player.currentPosition + incrementMs)
+
+    override fun seekBack(incrementMs: Long) = seekTo(player.currentPosition - incrementMs)
+
+    override fun setQuality(qualityId: String?) {
+        val ref = qualityId?.let { tracks.refs[it] ?: return }
+        player.trackSelectionParameters = TrackMapper.override(player.trackSelectionParameters, C.TRACK_TYPE_VIDEO, ref)
+    }
+
+    override fun setAudioTrack(trackId: String) {
+        val ref = tracks.refs[trackId] ?: return
+        player.trackSelectionParameters = TrackMapper.override(player.trackSelectionParameters, C.TRACK_TYPE_AUDIO, ref)
+            .buildUpon()
+            // Also prefer the language, so the choice carries over to the next title.
+            .setPreferredAudioLanguage(ref.group.getFormat(ref.index).language)
             .build()
-        exoPlayer.setMediaItem(mediaItem)
-        exoPlayer.prepare()
-        exoPlayer.playWhenReady = playWhenReady
-        _state.value = PlaybackState(media = media, status = PlaybackState.Status.Buffering)
-        analytics.track(
-            AnalyticsEvent(
-                AnalyticsEvent.Types.PLAYBACK_STARTED,
-                mapOf(
-                    AnalyticsEvent.Params.CONTENT_ID to media.id,
-                    AnalyticsEvent.Params.IS_LIVE to media.isLive.toString(),
-                ),
-            ),
+    }
+
+    override fun setSubtitleTrack(trackId: String?) {
+        val params = player.trackSelectionParameters
+        player.trackSelectionParameters = if (trackId == null) {
+            params.buildUpon().clearOverridesOfType(C.TRACK_TYPE_TEXT).setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+        } else {
+            val ref = tracks.refs[trackId] ?: return
+            TrackMapper.override(params, C.TRACK_TYPE_TEXT, ref)
+        }
+    }
+
+    override fun setSpeed(speed: Float) {
+        if (!_state.value.canChangeSpeed) return
+        player.setPlaybackSpeed(speed.coerceIn(MIN_SPEED, MAX_SPEED))
+    }
+
+    override fun goToLive() {
+        if (player.isCurrentMediaItemLive) {
+            player.seekToDefaultPosition()
+            player.play()
+        }
+    }
+
+    override fun retry() {
+        if (player.playerError?.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW || player.isCurrentMediaItemLive) {
+            player.seekToDefaultPosition()
+        }
+        player.prepare()
+        player.play()
+    }
+
+    /** Stops playback and frees the decoder, ads loader, MediaSession and Cast resources. */
+    fun release() {
+        if (released) return
+        released = true
+        reportProgress(isFinal = true)
+        scope.cancel()
+        MediaController.releaseFuture(sessionControllerFuture)
+        if (ActiveSessionHolder.session === mediaSession) ActiveSessionHolder.session = null
+        mediaSession.release()
+        player.removeListener(playerListener)
+        exoPlayer.removeAnalyticsListener(exoAnalyticsListener)
+        adsLoader.setPlayer(null)
+        adsLoader.release()
+        // CastPlayer.release() also releases the local ExoPlayer it wraps.
+        player.release()
+    }
+
+    private fun startTicker() {
+        scope.launch {
+            var sinceProgressMs = 0L
+            while (isActive) {
+                delay(TICK_MS)
+                updateState()
+                if (player.isPlaying && !player.isPlayingAd) {
+                    sinceProgressMs += TICK_MS
+                    if (sinceProgressMs >= PlaybackAnalyticsListener.PROGRESS_INTERVAL_MS) {
+                        sinceProgressMs = 0L
+                        reportProgress(isFinal = false)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateState() {
+        if (released) return
+        val p = player
+        val duration = p.duration.takeIf { it != C.TIME_UNSET } ?: 0L
+        val isLive = p.isCurrentMediaItemLive
+        val videoSize = p.videoSize
+        val isCasting = p.deviceInfo.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE
+        val liveBehindMs = if (isLive) liveBehindMs(p) else 0L
+        _state.value = _state.value.copy(
+            status = when {
+                p.playerError != null -> PlaybackStatus.Error
+                p.playbackState == Player.STATE_BUFFERING -> PlaybackStatus.Buffering
+                p.playbackState == Player.STATE_READY -> PlaybackStatus.Ready
+                p.playbackState == Player.STATE_ENDED -> PlaybackStatus.Ended
+                else -> PlaybackStatus.Idle
+            },
+            isPlaying = p.isPlaying,
+            playWhenReady = p.playWhenReady,
+            positionMs = p.currentPosition.coerceAtLeast(0L),
+            durationMs = duration,
+            bufferedPositionMs = p.bufferedPosition.coerceAtLeast(0L),
+            isLive = isLive,
+            isSeekable = p.isCurrentMediaItemSeekable,
+            isAtLiveEdge = isLive && liveBehindMs <= LIVE_EDGE_TOLERANCE_MS,
+            liveBehindMs = liveBehindMs,
+            isPlayingAd = p.isPlayingAd,
+            videoQualities = tracks.videoQualities,
+            selectedVideoQualityId = tracks.selectedVideoQualityId,
+            currentVideoHeight = currentVideoHeight,
+            audioTracks = tracks.audioTracks,
+            selectedAudioTrackId = tracks.selectedAudioTrackId,
+            subtitleTracks = tracks.subtitleTracks,
+            selectedSubtitleTrackId = tracks.selectedSubtitleTrackId,
+            playbackSpeed = p.playbackParameters.speed,
+            videoWidth = (videoSize.width * videoSize.pixelWidthHeightRatio).toInt(),
+            videoHeight = videoSize.height,
+            isCasting = isCasting,
+            castDeviceName = if (isCasting) CastSupport.currentDeviceName(context) else null,
+            error = p.playerError?.toPlayerError(),
         )
     }
 
-    fun play() = exoPlayer.play()
-
-    fun pause() = exoPlayer.pause()
-
-    fun seekTo(positionMs: Long) = exoPlayer.seekTo(positionMs)
-
-    /** Jumps back to the live edge after the viewer paused or scrubbed back in a live stream. */
-    fun seekToLiveEdge() {
-        if (exoPlayer.isCurrentMediaItemLive) exoPlayer.seekToDefaultPosition()
+    /**
+     * Distance from the live edge. Players intentionally stay a few segments behind the end of
+     * the live window, so the "edge" is the window's default position, not its end.
+     */
+    private fun liveBehindMs(p: Player): Long {
+        val timeline = p.currentTimeline
+        if (timeline.isEmpty) return 0L
+        val window = timeline.getWindow(p.currentMediaItemIndex, Timeline.Window())
+        return (window.defaultPositionMs - p.currentPosition).coerceAtLeast(0L)
     }
 
-    /** Clears the error and tries the current item again. */
-    fun retry() {
-        _state.update { it.copy(status = PlaybackState.Status.Buffering, errorMessage = null) }
-        exoPlayer.prepare()
+    private fun reportProgress(isFinal: Boolean) {
+        val request = _state.value.request ?: return
+        if (released && !isFinal) return
+        val p = player
+        if (p.isCurrentMediaItemLive || p.isPlayingAd) return
+        val position = p.currentPosition
+        val duration = p.duration.takeIf { it != C.TIME_UNSET } ?: return
+        if (!isFinal) analyticsListeners.forEach { it.onProgress(request, position, duration) }
+        progressReporters.forEach { it.reportProgress(request, position, duration, isFinal) }
     }
 
-    fun release() {
-        exoPlayer.removeListener(listener)
-        exoPlayer.release()
+    private fun sessionActivity(): PendingIntent? {
+        val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            ?: context.packageManager.getLeanbackLaunchIntentForPackage(context.packageName)
+            ?: return null
+        return PendingIntent.getActivity(
+            context,
+            0,
+            launch,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
     }
 
-    @OptIn(UnstableApi::class)
-    private fun isAtLiveEdge(): Boolean {
-        if (!exoPlayer.isCurrentMediaItemLive) return false
-        val offset = exoPlayer.currentLiveOffset
-        return offset != C.TIME_UNSET && offset <= LIVE_EDGE_TOLERANCE_MS
-    }
+    private fun PlaybackException.toPlayerError() = PlayerError(errorCode, errorCodeName, message)
 
     class Factory @Inject constructor(
         @param:ApplicationContext private val context: Context,
-        private val analytics: AnalyticsTracker,
+        private val analyticsListeners: Set<@JvmSuppressWildcards PlaybackAnalyticsListener>,
+        private val progressReporters: Set<@JvmSuppressWildcards ProgressReporter>,
     ) {
-        fun create(): CineVersePlayer = CineVersePlayer(context, analytics)
+        fun create(): CineVersePlayer = CineVersePlayer(context, analyticsListeners, progressReporters)
     }
 
     private companion object {
-        const val LIVE_EDGE_TOLERANCE_MS = 15_000L
+        const val TICK_MS = 500L
+        const val LIVE_EDGE_TOLERANCE_MS = 10_000L
+        const val MIN_SPEED = 0.25f
+        const val MAX_SPEED = 2f
     }
 }

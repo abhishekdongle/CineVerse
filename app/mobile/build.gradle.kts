@@ -26,6 +26,8 @@ dependencies {
     implementation(projects.feature.home.ui)
     implementation(projects.core.domain)
     implementation(projects.core.player)
+    implementation(projects.core.playerUiMobile)
+    implementation(projects.core.analytics)
     implementation(projects.core.notifications)
     // Not used from app code: it puts the repository bindings into this app's Hilt graph.
     implementation(projects.core.data)
